@@ -1,0 +1,202 @@
+import os
+import csv
+import time
+import hashlib
+import requests
+import psutil
+from datetime import datetime
+from tqdm import tqdm
+
+VT_API_KEY = ""
+VT_URL = "https://www.virustotal.com/api/v3/files/{}"
+
+def get_file_hash(file_path):
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(8192):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+def check_virus_total(file_hash):
+    headers = {"x-apikey": VT_API_KEY}
+    url = VT_URL.format(file_hash)
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        result = response.json()
+        return result['data']['attributes']['last_analysis_stats']
+    elif response.status_code == 404:
+        return None
+    else:
+        print(f"Ошибка при запросе к VirusTotal: {response.status_code}")
+        return None
+
+def is_suspicious(stats):
+    if stats is None:
+        return False
+
+    malicious = stats.get('malicious', 0)
+    suspicious = stats.get('suspicious', 0)
+
+    return malicious > 0 or suspicious > 0
+
+
+def save_report(report_data, errors, filename="report.txt"):
+    total_processes = len(report_data)
+    suspicious_count = 0
+    clean_count = 0
+
+    # Подготовка данных для сводки
+    for entry in report_data:
+        stats = entry.get('stats', {})
+        if is_suspicious(stats):
+            suspicious_count += 1
+        else:
+            clean_count += 1
+
+    with open(filename, "w", newline='', encoding='utf-8') as f:
+        # Заголовок отчета
+        f.write(f"{'='*70}\n")
+        f.write(f" Отчет проверки процессов - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"{'='*70}\n\n")
+
+        # Сводка
+        f.write("Сводка:\n")
+        f.write(f"  Всего процессов проверено: {total_processes}\n")
+        f.write(f"  Подозрительных процессов: {suspicious_count}\n")
+        f.write(f"  Чистых процессов: {clean_count}\n")
+        f.write(f"  Пропущено ошибок доступа: {len(errors)}\n\n")
+
+        # Таблица с деталями
+        f.write("Детали процессов:\n")
+        headers = [
+            "Process Name", "PID", "File Path", "SHA256 Hash",
+            "Malicious", "Suspicious", "Harmless", "Status"
+        ]
+
+        # Вычисляем максимальную длину для каждой колонки
+        try:
+            col_widths = {
+                "Process Name": max(len(entry.get('name', 'N/A')) for entry in report_data + [{"name": "Process Name"}]),
+                "PID": max(len(str(entry.get('pid', 'N/A'))) for entry in report_data + [{"pid": "PID"}]),
+                "File Path": max(len(entry.get('path', 'N/A')) for entry in report_data + [{"path": "File Path"}]),
+                "SHA256 Hash": 64,  # SHA256 всегда имеет фиксированную длину
+                "Malicious": max(
+                    len(str(stats.get('malicious', 0))) 
+                    for entry in report_data 
+                    for stats in [entry.get('stats', {})] 
+                    if isinstance(stats, dict)
+                ) or len("Malicious"),
+                "Suspicious": max(
+                    len(str(stats.get('suspicious', 0))) 
+                    for entry in report_data 
+                    for stats in [entry.get('stats', {})] 
+                    if isinstance(stats, dict)
+                ) or len("Suspicious"),
+                "Harmless": max(
+                    len(str(stats.get('harmless', 0))) 
+                    for entry in report_data 
+                    for stats in [entry.get('stats', {})] 
+                    if isinstance(stats, dict)
+                ) or len("Harmless"),
+                "Status": max(
+                    len(is_suspicious(entry.get('stats', {})) and "Suspicious" or "Clean") 
+                    for entry in report_data
+                ) or len("Status")
+            }
+        except Exception as e:
+            print(f"Ошибка при вычислении ширины колонок: {e}")
+            col_widths = {
+                "Process Name": 20,
+                "PID": 5,
+                "File Path": 50,
+                "SHA256 Hash": 64,
+                "Malicious": 10,
+                "Suspicious": 10,
+                "Harmless": 10,
+                "Status": 10
+            }
+
+        # Функция для форматирования строки с выравниванием
+        def format_row(row_data):
+            return (
+                f"{row_data['Process Name']:<{col_widths['Process Name']}} | "
+                f"{str(row_data['PID']):>{col_widths['PID']}} | "
+                f"{row_data['File Path']:<{col_widths['File Path']}} | "
+                f"{row_data['SHA256 Hash']:<{col_widths['SHA256 Hash']}} | "
+                f"{str(row_data['Malicious']):>{col_widths['Malicious']}} | "
+                f"{str(row_data['Suspicious']):>{col_widths['Suspicious']}} | "
+                f"{str(row_data['Harmless']):>{col_widths['Harmless']}} | "
+                f"{row_data['Status']:<{col_widths['Status']}}"
+            )
+
+        # Запись заголовков
+        header_row = {key: key for key in headers}
+        f.write(format_row(header_row) + "\n")
+        f.write("-" * sum(col_widths.values()) + "-" * (len(headers) * 3 - 1) + "\n")
+
+        # Запись данных
+        for entry in report_data:
+            stats = entry.get('stats', {})
+            if not isinstance(stats, dict):
+                stats = {}
+
+            status = "Suspicious" if is_suspicious(stats) else "Clean"
+
+            row_data = {
+                "Process Name": entry.get('name', 'N/A'),
+                "PID": entry.get('pid', 'N/A'),
+                "File Path": entry.get('path', 'N/A'),
+                "SHA256 Hash": entry.get('hash', 'N/A'),
+                "Malicious": stats.get('malicious', 0),
+                "Suspicious": stats.get('suspicious', 0),
+                "Harmless": stats.get('harmless', 0),
+                "Status": status
+            }
+            f.write(format_row(row_data) + "\n")
+
+        # Раздел ошибок
+        if errors:
+            f.write("\nОшибки проверки:\n")
+            for error in errors:
+                f.write(f"  - {error}\n")
+
+    print(f"\nОтчет успешно сохранен в файл {filename}")
+
+
+def main():
+    report_data = []
+    errors = []
+    processes = list(psutil.process_iter(['pid', 'name', 'exe']))
+
+    print("Начинается проверка процессов...")
+
+    for proc in tqdm(processes, desc="Проверка процессов", unit="proc"):
+        try:
+            pid = proc.info['pid']
+            name = proc.info['name']
+            exe_path = proc.info['exe']
+
+            if exe_path and os.path.isfile(exe_path):
+                file_hash = get_file_hash(exe_path)
+
+                stats = check_virus_total(file_hash)
+
+                report_data.append({
+                    'pid': pid,
+                    'name': name,
+                    'path': exe_path,
+                    'hash': file_hash,
+                    'stats': stats
+                })
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied, FileNotFoundError):
+	    errors.append(f"PID: {proc.pid} - {str(e)}")
+            continue
+
+    save_report(report_data, errors)
+    print("\nОтчет успешно сохранен в файл report.txt")
+
+if __name__ == "__main__":
+    main()
+
